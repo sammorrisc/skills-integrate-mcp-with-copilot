@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import os
 from pathlib import Path
+import sqlite3
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -77,6 +78,86 @@ activities = {
     }
 }
 
+# --- Simple SQLite persistence (replaces transient in-memory storage) ---
+DB_PATH = current_dir / "data.db"
+
+
+def connect_db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    """Create tables and seed from the current in-memory `activities` if DB is empty."""
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS activities (
+            name TEXT PRIMARY KEY,
+            description TEXT,
+            schedule TEXT,
+            max_participants INTEGER
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS participants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            activity_name TEXT,
+            email TEXT,
+            FOREIGN KEY(activity_name) REFERENCES activities(name)
+        )
+        """
+    )
+
+    cur.execute("SELECT COUNT(*) as cnt FROM activities")
+    row = cur.fetchone()
+    cnt = row["cnt"] if row is not None else 0
+
+    # If DB is empty, seed from the current in-memory dict
+    if cnt == 0:
+        for name, info in activities.items():
+            cur.execute(
+                "INSERT INTO activities (name, description, schedule, max_participants) VALUES (?, ?, ?, ?)",
+                (name, info.get("description"), info.get("schedule"), info.get("max_participants")),
+            )
+            for email in info.get("participants", []):
+                cur.execute(
+                    "INSERT INTO participants (activity_name, email) VALUES (?, ?)", (name, email)
+                )
+        conn.commit()
+
+    conn.close()
+
+
+def load_activities_from_db():
+    """Populate the `activities` dict from the DB."""
+    global activities
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute("SELECT name, description, schedule, max_participants FROM activities")
+    rows = cur.fetchall()
+    new_activities = {}
+    for r in rows:
+        cur.execute("SELECT email FROM participants WHERE activity_name = ?", (r["name"],))
+        participants = [p["email"] for p in cur.fetchall()]
+        new_activities[r["name"]] = {
+            "description": r["description"],
+            "schedule": r["schedule"],
+            "max_participants": r["max_participants"],
+            "participants": participants,
+        }
+    conn.close()
+    activities = new_activities
+
+
+# Initialize DB and load data so the app uses persistent storage
+init_db()
+load_activities_from_db()
+
 
 @app.get("/")
 def root():
@@ -105,8 +186,17 @@ def signup_for_activity(activity_name: str, email: str):
             detail="Student is already signed up"
         )
 
-    # Add student
+    # Add student (memory)
     activity["participants"].append(email)
+    # Persist to DB
+    try:
+        conn = connect_db()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO participants (activity_name, email) VALUES (?, ?)", (activity_name, email))
+        conn.commit()
+    finally:
+        conn.close()
+
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
@@ -127,6 +217,15 @@ def unregister_from_activity(activity_name: str, email: str):
             detail="Student is not signed up for this activity"
         )
 
-    # Remove student
+    # Remove student (memory)
     activity["participants"].remove(email)
+    # Persist removal to DB
+    try:
+        conn = connect_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM participants WHERE activity_name = ? AND email = ?", (activity_name, email))
+        conn.commit()
+    finally:
+        conn.close()
+
     return {"message": f"Unregistered {email} from {activity_name}"}
